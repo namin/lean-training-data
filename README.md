@@ -35,6 +35,12 @@ We would like to enable sharing of data and easy access to the Lean libraries fo
   Filtering flags: `--tactics` (only tactic nodes) `--substantive` (no structuring tactics) and
   `--original` (no synthetic syntax nodes, e.g. from macro expansions)
 
+`declaration_structures`
+: Extract detailed structural information from declarations by traversing the Lean AST.
+  Outputs JSON with explicit premise counts, nesting depth, typeclass constraints,
+  classical logic usage, and other structural properties essential for understanding
+  declaration complexity and usability.
+
 ## Usage instructions
 
 * `git clone https://github.com/semorrison/lean-training-data.git`
@@ -294,3 +300,45 @@ Please ping me if you'd like these to be updated. (We could run a CI job.)
 
 If you use these tools or the downloadable releases to prepare other publicly available datasets
 (e.g. train/test splits) or models, please reference this repository to help others find it.
+
+### `declaration_structures`
+
+`lake exe declaration_structures Mathlib` will extract detailed structural information from every declaration in the environment by traversing the Lean `Expr` AST.
+
+This tool goes beyond simple type string analysis to extract:
+- **Explicit premise counts**: How many arguments users must explicitly provide
+- **Implicit arguments**: Parameters Lean infers automatically
+- **Typeclass constraints**: Instance arguments resolved by typeclass search
+- **Nesting depth**: Maximum depth of binders
+- **Classical logic usage**: Detects `Classical.choice`, `Classical.em`, etc.
+- **Decidability**: Presence of `Decidable` instances
+- **Polymorphism**: Universe parameter usage
+- **Conclusion structure**: Head symbol and arity of what's being proven
+
+Sample output (JSONL format):
+
+```json
+{
+  "name": "TopologicalSpace.Opens.map_id_obj",
+  "kind": "theorem",
+  "type": "∀ {X : TopCat} (x : ↑X) (U : TopologicalSpace.Opens ↑X), ...",
+  "binders": [
+    {"kind": "forall", "name": "X", "type": "TopCat", "implicit": true, "instImplicit": false, "level": 0},
+    {"kind": "forall", "name": "x", "type": "↑X", "implicit": false, "instImplicit": false, "level": 1},
+    {"kind": "arrow", "name": "_", "type": "TopologicalSpace.Opens ↑X", "implicit": false, "instImplicit": false, "level": 2}
+  ],
+  "num_explicit_premises": 1,
+  "num_implicit_args": 2,
+  "num_typeclass_constraints": 0,
+  "num_forall": 2,
+  "num_arrows": 1,
+  "max_nesting_depth": 2,
+  "conclusion_head": "Eq",
+  "conclusion_arity": 3,
+  "uses_classical": false,
+  "is_polymorphic": true,
+  "has_decidable_instances": false,
+  "namespace_depth": 3
+}
+```
+
