@@ -50,37 +50,64 @@ partial def collectBinders (e : Expr) (depth : Nat := 0) :
   -- Limit depth to prevent infinite recursion/timeout
   if depth > 50 then
     return (#[], e)
-  match e with
-  | Expr.forallE name type body bi =>
-    let typeStr ← safeExprToString type  -- Use safe version
-    -- Check if this is an arrow (non-dependent function type)
-    let isArrow := !body.hasLooseBVar 0
-    let kind := if isArrow then "arrow" else "forall"
-    let binder : BinderData := {
-      kind := kind
-      name := name.toString
-      type := typeStr
-      implicit := bi.isImplicit
-      instImplicit := bi.isInstImplicit
-      level := depth
-    }
-    -- Simpler approach: don't instantiate variables
-    let (restBinders, conclusion) ← collectBinders body (depth + 1)
-    return (#[binder] ++ restBinders, conclusion)
-  | Expr.lam name type body bi =>
-    let typeStr ← safeExprToString type  -- Use safe version
-    let binder : BinderData := {
-      kind := "lambda"
-      name := name.toString
-      type := typeStr
-      implicit := bi.isImplicit
-      instImplicit := bi.isInstImplicit
-      level := depth
-    }
-    -- Simpler approach: don't instantiate variables  
-    let (restBinders, conclusion) ← collectBinders body (depth + 1)
-    return (#[binder] ++ restBinders, conclusion)
-  | _ => return (#[], e)
+  try
+    match e with
+    | Expr.forallE name type body bi =>
+      -- Safer type string extraction
+      let typeStr ← try
+        safeExprToString type
+      catch _ =>
+        pure "<type>"
+      
+      -- Check if this is an arrow (non-dependent function type)
+      -- Just check the body directly without instantiation
+      let isArrow := !body.hasLooseBVar 0
+      let kind := if isArrow then "arrow" else "forall"
+      let binder : BinderData := {
+        kind := kind
+        name := name.toString
+        type := typeStr
+        implicit := bi.isImplicit
+        instImplicit := bi.isInstImplicit
+        level := depth
+      }
+      
+      -- For recursive call, we need to be careful with bound variables
+      -- Create a fresh free variable to substitute
+      let fvarId ← mkFreshFVarId
+      let fvar := Expr.fvar fvarId
+      let bodySubst := body.instantiate1 fvar
+      
+      -- Recursively process the substituted body
+      let (restBinders, conclusion) ← collectBinders bodySubst (depth + 1)
+      return (#[binder] ++ restBinders, conclusion)
+    | Expr.lam name type body bi =>
+      let typeStr ← try
+        safeExprToString type
+      catch _ =>
+        pure "<type>"
+      
+      let binder : BinderData := {
+        kind := "lambda"
+        name := name.toString
+        type := typeStr
+        implicit := bi.isImplicit
+        instImplicit := bi.isInstImplicit
+        level := depth
+      }
+      
+      -- Create a fresh free variable to substitute
+      let fvarId ← mkFreshFVarId
+      let fvar := Expr.fvar fvarId
+      let bodySubst := body.instantiate1 fvar
+      
+      -- Recursively process the substituted body
+      let (restBinders, conclusion) ← collectBinders bodySubst (depth + 1)
+      return (#[binder] ++ restBinders, conclusion)
+    | _ => return (#[], e)
+  catch _ =>
+    -- If anything fails, just return what we have
+    return (#[], e)
 
 /-- Get the head symbol of an expression -/
 def getHeadSymbol (e : Expr) : MetaM String := do
@@ -123,53 +150,55 @@ where
 
 /-- Analyze a declaration's type structure -/
 def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
-  let (binders, conclusion) ← collectBinders e
-  
-  let explicitPremises := binders.filter fun b => 
-    b.kind == "arrow" && !b.implicit && !b.instImplicit
-  
-  let implicitArgs := binders.filter fun b =>
-    b.implicit && !b.instImplicit && b.kind != "arrow"
+  -- Increase heartbeat limit for complex expressions
+  withOptions (fun o => o.set `maxHeartbeats (1000000 : Nat)) do
+    let (binders, conclusion) ← collectBinders e
     
-  let typeclassConstraints := binders.filter fun b =>
-    b.instImplicit
-  
-  let forallCount := binders.filter (·.kind == "forall") |>.size
-  let arrowCount := binders.filter (·.kind == "arrow") |>.size
-  let existsCount := countExists conclusion
-  
-  let maxDepth := binders.map (·.level) |>.foldl max 0
-  
-  let conclusionHead ← getHeadSymbol conclusion
-  let conclusionArity := conclusion.getAppNumArgs
-  
-  let usesClassical := usesClassicalLogic e
-  let hasDecidable := hasDecidableInstances e
-  
-  let namespaceDepth := name.components.length
-  let isPolymorphic := e.hasLevelParam
-  
-  let typeStr ← safeExprToString e  -- Use safe version
-  
-  return {
-    name := name.toString
-    kind := ""  -- will be set by caller
-    type := typeStr
-    binders := binders
-    num_explicit_premises := explicitPremises.size
-    num_implicit_args := implicitArgs.size
-    num_typeclass_constraints := typeclassConstraints.size
-    num_forall := forallCount
-    num_exists := existsCount
-    num_arrows := arrowCount
-    max_nesting_depth := maxDepth
-    conclusion_head := conclusionHead
-    conclusion_arity := conclusionArity
-    uses_classical := usesClassical
-    namespace_depth := namespaceDepth
-    is_polymorphic := isPolymorphic
-    has_decidable_instances := hasDecidable
-  }
+    let explicitPremises := binders.filter fun b => 
+      b.kind == "arrow" && !b.implicit && !b.instImplicit
+    
+    let implicitArgs := binders.filter fun b =>
+      b.implicit && !b.instImplicit && b.kind != "arrow"
+      
+    let typeclassConstraints := binders.filter fun b =>
+      b.instImplicit
+    
+    let forallCount := binders.filter (·.kind == "forall") |>.size
+    let arrowCount := binders.filter (·.kind == "arrow") |>.size
+    let existsCount := countExists conclusion
+    
+    let maxDepth := binders.map (·.level) |>.foldl max 0
+    
+    let conclusionHead ← getHeadSymbol conclusion
+    let conclusionArity := conclusion.getAppNumArgs
+    
+    let usesClassical := usesClassicalLogic e
+    let hasDecidable := hasDecidableInstances e
+    
+    let namespaceDepth := name.components.length
+    let isPolymorphic := e.hasLevelParam
+    
+    let typeStr ← safeExprToString e  -- Use safe version
+    
+    return {
+      name := name.toString
+      kind := ""  -- will be set by caller
+      type := typeStr
+      binders := binders
+      num_explicit_premises := explicitPremises.size
+      num_implicit_args := implicitArgs.size
+      num_typeclass_constraints := typeclassConstraints.size
+      num_forall := forallCount
+      num_exists := existsCount
+      num_arrows := arrowCount
+      max_nesting_depth := maxDepth
+      conclusion_head := conclusionHead
+      conclusion_arity := conclusionArity
+      uses_classical := usesClassical
+      namespace_depth := namespaceDepth
+      is_polymorphic := isPolymorphic
+      has_decidable_instances := hasDecidable
+    }
 
 /-- Convert structure to JSON format -/
 def DeclStructure.toJson (s : DeclStructure) : String :=
@@ -224,7 +253,10 @@ def main (args : List String) : IO UInt32 := do
             if c.type.approxDepth > 100 then
               stats.modify fun s => { s with skipped := s.skipped + 1 }
             else
-              let declStruct ← MetaM.run' (analyzeExpr n c.type)
+              -- Run with increased heartbeat limit globally
+              let declStruct ← MetaM.run' do
+                withOptions (fun o => o.set `maxHeartbeats (5000000 : Nat)) do
+                  analyzeExpr n c.type
               let declStructWithKind := { declStruct with kind := c.kind }
               IO.println declStructWithKind.toJson
               stats.modify fun s => { s with processed := s.processed + 1 }
