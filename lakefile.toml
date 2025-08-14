@@ -1,5 +1,5 @@
 name = "«lean-training-data»"
-defaultTargets = ["TrainingData", "Examples", "tactic_benchmark", "export_infotree", "training_data", "comment_data", "premises", "declaration_types", "goal_comments"]
+defaultTargets = ["TrainingData", "Examples", "tactic_benchmark", "export_infotree", "training_data", "comment_data", "premises", "declaration_types", "declaration_structures", "goal_comments"]
 
 [[require]]
 name = "mathlib"
@@ -39,6 +39,10 @@ root = "scripts.premises"
 [[lean_exe]]
 name = "declaration_types"
 root = "scripts.declaration_types"
+
+[[lean_exe]]
+name = "declaration_structures"
+root = "scripts.declaration_structures"
 
 [[lean_exe]]
 name = "goal_comments"
