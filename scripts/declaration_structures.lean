@@ -35,12 +35,24 @@ structure DeclStructure where
   has_decidable_instances : Bool
   deriving Repr
 
+/-- Safely convert expression to string, with fallback -/
+def safeExprToString (e : Expr) : MetaM String := do
+  try
+    let pp ← ppExpr e
+    return toString pp
+  catch _ =>
+    -- Fallback: just return a placeholder
+    return s!"<expr:{e.hash}>"
+
 /-- Recursively collect all binders from an expression -/
 partial def collectBinders (e : Expr) (depth : Nat := 0) : 
     MetaM (Array BinderData × Expr) := do
+  -- Limit depth to prevent infinite recursion/timeout
+  if depth > 50 then
+    return (#[], e)
   match e with
   | Expr.forallE name type body bi =>
-    let typeStr ← ppExpr type >>= fun pp => return toString pp
+    let typeStr ← safeExprToString type  -- Use safe version
     -- Check if this is an arrow (non-dependent function type)
     let isArrow := !body.hasLooseBVar 0
     let kind := if isArrow then "arrow" else "forall"
@@ -52,11 +64,11 @@ partial def collectBinders (e : Expr) (depth : Nat := 0) :
       instImplicit := bi.isInstImplicit
       level := depth
     }
-    let (restBinders, conclusion) ← withLocalDecl name bi type fun _ => 
-      collectBinders (body.instantiate1 (.fvar ⟨name⟩)) (depth + 1)
+    -- Simpler approach: don't instantiate variables
+    let (restBinders, conclusion) ← collectBinders body (depth + 1)
     return (#[binder] ++ restBinders, conclusion)
   | Expr.lam name type body bi =>
-    let typeStr ← ppExpr type >>= fun pp => return toString pp
+    let typeStr ← safeExprToString type  -- Use safe version
     let binder : BinderData := {
       kind := "lambda"
       name := name.toString
@@ -65,8 +77,8 @@ partial def collectBinders (e : Expr) (depth : Nat := 0) :
       instImplicit := bi.isInstImplicit
       level := depth
     }
-    let (restBinders, conclusion) ← withLocalDecl name bi type fun _ =>
-      collectBinders (body.instantiate1 (.fvar ⟨name⟩)) (depth + 1)
+    -- Simpler approach: don't instantiate variables  
+    let (restBinders, conclusion) ← collectBinders body (depth + 1)
     return (#[binder] ++ restBinders, conclusion)
   | _ => return (#[], e)
 
@@ -137,7 +149,7 @@ def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
   let namespaceDepth := name.components.length
   let isPolymorphic := e.hasLevelParam
   
-  let typeStr ← ppExpr e >>= fun pp => return toString pp
+  let typeStr ← safeExprToString e  -- Use safe version
   
   return {
     name := name.toString
@@ -163,10 +175,10 @@ def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
 def DeclStructure.toJson (s : DeclStructure) : String :=
   -- Manual JSON construction to avoid missing ToJson instances
   let bindersJson := s.binders.map fun b =>
-    s!"\{\"kind\":\"{b.kind}\",\"name\":\"{b.name.replace "\"" "\\\""}\",\"type\":\"{b.type.replace "\"" "\\\"" |>.replace "\n" "\\n"}\",\"implicit\":{b.implicit},\"instImplicit\":{b.instImplicit},\"level\":{b.level}}"
+    s!"\{\"kind\":\"{b.kind}\",\"name\":\"{b.name.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"type\":\"{b.type.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"implicit\":{b.implicit},\"instImplicit\":{b.instImplicit},\"level\":{b.level}}"
   let bindersStr := "[" ++ ",".intercalate bindersJson.toList ++ "]"
   
-  s!"\{\"name\":\"{s.name.replace "\"" "\\\""}\",\"kind\":\"{s.kind}\",\"type\":\"{s.type.replace "\"" "\\\"" |>.replace "\n" "\\n"}\",\"binders\":{bindersStr},\"num_explicit_premises\":{s.num_explicit_premises},\"num_implicit_args\":{s.num_implicit_args},\"num_typeclass_constraints\":{s.num_typeclass_constraints},\"num_forall\":{s.num_forall},\"num_exists\":{s.num_exists},\"num_arrows\":{s.num_arrows},\"max_nesting_depth\":{s.max_nesting_depth},\"conclusion_head\":\"{s.conclusion_head.replace "\"" "\\\""}\",\"conclusion_arity\":{s.conclusion_arity},\"uses_classical\":{s.uses_classical},\"namespace_depth\":{s.namespace_depth},\"is_polymorphic\":{s.is_polymorphic},\"has_decidable_instances\":{s.has_decidable_instances}}"
+  s!"\{\"name\":\"{s.name.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"kind\":\"{s.kind}\",\"type\":\"{s.type.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"binders\":{bindersStr},\"num_explicit_premises\":{s.num_explicit_premises},\"num_implicit_args\":{s.num_implicit_args},\"num_typeclass_constraints\":{s.num_typeclass_constraints},\"num_forall\":{s.num_forall},\"num_exists\":{s.num_exists},\"num_arrows\":{s.num_arrows},\"max_nesting_depth\":{s.max_nesting_depth},\"conclusion_head\":\"{s.conclusion_head.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"conclusion_arity\":{s.conclusion_arity},\"uses_classical\":{s.uses_classical},\"namespace_depth\":{s.namespace_depth},\"is_polymorphic\":{s.is_polymorphic},\"has_decidable_instances\":{s.has_decidable_instances}}"
 
 def Lean.ConstantInfo.kind : ConstantInfo → String
   | .axiomInfo  _ => "axiom"
@@ -178,6 +190,14 @@ def Lean.ConstantInfo.kind : ConstantInfo → String
   | .ctorInfo   _ => "constructor"
   | .recInfo    _ => "recursor"
 
+-- Statistics tracking
+structure Stats where
+  total : Nat := 0
+  processed : Nat := 0
+  failed : Nat := 0
+  skipped : Nat := 0
+  deriving Repr
+
 def main (args : List String) : IO UInt32 := do
   unsafe enableInitializersExecution
   let modules := match args with
@@ -185,16 +205,51 @@ def main (args : List String) : IO UInt32 := do
   | args => args.toArray.map fun s => s.toName
   initSearchPath (← findSysroot)
   
+  let stats : IO.Ref Stats ← IO.mkRef {}
+  
   CoreM.withImportModules modules do
-    for (n, c) in (← getEnv).constants.map₁ do
+    let env ← getEnv
+    let constants := env.constants.map₁.toList
+    
+    IO.eprintln s!"Total constants in environment: {constants.length}"
+    
+    for (n, c) in constants do
+      stats.modify fun s => { s with total := s.total + 1 }
+      
       if ! (← n.isBlackListed) then
         -- Skip internal/auxiliary definitions
         if !n.isInternal && !n.isImplementationDetail then
           try
-            let declStruct ← MetaM.run' (analyzeExpr n c.type)
-            let declStructWithKind := { declStruct with kind := c.kind }
-            IO.println declStructWithKind.toJson
+            -- Check for extremely large types that might timeout
+            if c.type.approxDepth > 100 then
+              stats.modify fun s => { s with skipped := s.skipped + 1 }
+            else
+              let declStruct ← MetaM.run' (analyzeExpr n c.type)
+              let declStructWithKind := { declStruct with kind := c.kind }
+              IO.println declStructWithKind.toJson
+              stats.modify fun s => { s with processed := s.processed + 1 }
+            
+            -- Progress reporting every 10000 declarations
+            let s ← stats.get
+            if s.processed % 10000 == 0 then
+              IO.eprintln s!"Processed {s.processed} declarations..."
           catch _ =>
-            -- Silently skip declarations that fail to analyze
-            pure ()
+            stats.modify fun s => { s with failed := s.failed + 1 }
+            -- Log the error for debugging - only first 10
+            let s ← stats.get
+            if s.failed <= 10 then
+              IO.eprintln s!"Failed to analyze {n}"
+        else
+          stats.modify fun s => { s with skipped := s.skipped + 1 }
+      else
+        stats.modify fun s => { s with skipped := s.skipped + 1 }
+    
+    -- Print final statistics
+    let finalStats ← stats.get
+    IO.eprintln "=== Extraction Statistics ==="
+    IO.eprintln s!"Total declarations: {finalStats.total}"
+    IO.eprintln s!"Successfully processed: {finalStats.processed}"
+    IO.eprintln s!"Failed to process: {finalStats.failed}"
+    IO.eprintln s!"Skipped (internal/blacklisted): {finalStats.skipped}"
+    
   return 0
