@@ -20,6 +20,9 @@ structure DeclStructure where
   kind : String
   type : String
   binders : Array BinderData
+  hypotheses : Array String  -- The actual hypothesis expressions (arrows)
+  hypothesis_heads : Array String  -- Head symbols of each hypothesis
+  conclusion : String  -- The conclusion after all hypotheses
   num_explicit_premises : Nat
   num_implicit_args : Nat
   num_typeclass_constraints : Nat
@@ -46,10 +49,10 @@ def safeExprToString (e : Expr) : MetaM String := do
 
 /-- Recursively collect all binders from an expression -/
 partial def collectBinders (e : Expr) (depth : Nat := 0) : 
-    MetaM (Array BinderData × Expr) := do
+    MetaM (Array BinderData × Array Expr × Expr) := do
   -- Limit depth to prevent infinite recursion/timeout
   if depth > 50 then
-    return (#[], e)
+    return (#[], #[], e)
   try
     match e with
     | Expr.forallE name type body bi =>
@@ -79,8 +82,10 @@ partial def collectBinders (e : Expr) (depth : Nat := 0) :
       let bodySubst := body.instantiate1 fvar
       
       -- Recursively process the substituted body
-      let (restBinders, conclusion) ← collectBinders bodySubst (depth + 1)
-      return (#[binder] ++ restBinders, conclusion)
+      let (restBinders, restHyps, conclusion) ← collectBinders bodySubst (depth + 1)
+      -- If it's an arrow, add the type expression to hypotheses
+      let hyps := if isArrow then #[type] else #[]
+      return (#[binder] ++ restBinders, hyps ++ restHyps, conclusion)
     | Expr.lam name type body bi =>
       let typeStr ← try
         safeExprToString type
@@ -102,12 +107,12 @@ partial def collectBinders (e : Expr) (depth : Nat := 0) :
       let bodySubst := body.instantiate1 fvar
       
       -- Recursively process the substituted body
-      let (restBinders, conclusion) ← collectBinders bodySubst (depth + 1)
-      return (#[binder] ++ restBinders, conclusion)
-    | _ => return (#[], e)
+      let (restBinders, restHyps, conclusion) ← collectBinders bodySubst (depth + 1)
+      return (#[binder] ++ restBinders, restHyps, conclusion)
+    | _ => return (#[], #[], e)
   catch _ =>
     -- If anything fails, just return what we have
-    return (#[], e)
+    return (#[], #[], e)
 
 /-- Get the head symbol of an expression -/
 def getHeadSymbol (e : Expr) : MetaM String := do
@@ -152,7 +157,7 @@ where
 def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
   -- Increase heartbeat limit for complex expressions
   withOptions (fun o => o.set `maxHeartbeats (1000000 : Nat)) do
-    let (binders, conclusion) ← collectBinders e
+    let (binders, hypExprs, conclusion) ← collectBinders e
     
     let explicitPremises := binders.filter fun b => 
       b.kind == "arrow" && !b.implicit && !b.instImplicit
@@ -162,6 +167,17 @@ def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
       
     let typeclassConstraints := binders.filter fun b =>
       b.instImplicit
+    
+    -- Extract hypothesis expressions (non-dependent arrows)
+    let hypotheses : Array String ← (binders.filter (·.kind == "arrow")).mapM fun b => 
+      return b.type
+    
+    -- Extract hypothesis head symbols
+    let hypothesisHeads : Array String ← hypExprs.mapM fun hypExpr =>
+      getHeadSymbol hypExpr
+    
+    -- Get conclusion string
+    let conclusionStr ← safeExprToString conclusion
     
     let forallCount := binders.filter (·.kind == "forall") |>.size
     let arrowCount := binders.filter (·.kind == "arrow") |>.size
@@ -185,6 +201,9 @@ def analyzeExpr (name : Name) (e : Expr) : MetaM DeclStructure := do
       kind := ""  -- will be set by caller
       type := typeStr
       binders := binders
+      hypotheses := hypotheses
+      hypothesis_heads := hypothesisHeads
+      conclusion := conclusionStr
       num_explicit_premises := explicitPremises.size
       num_implicit_args := implicitArgs.size
       num_typeclass_constraints := typeclassConstraints.size
@@ -207,7 +226,15 @@ def DeclStructure.toJson (s : DeclStructure) : String :=
     s!"\{\"kind\":\"{b.kind}\",\"name\":\"{b.name.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"type\":\"{b.type.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"implicit\":{b.implicit},\"instImplicit\":{b.instImplicit},\"level\":{b.level}}"
   let bindersStr := "[" ++ ",".intercalate bindersJson.toList ++ "]"
   
-  s!"\{\"name\":\"{s.name.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"kind\":\"{s.kind}\",\"type\":\"{s.type.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"binders\":{bindersStr},\"num_explicit_premises\":{s.num_explicit_premises},\"num_implicit_args\":{s.num_implicit_args},\"num_typeclass_constraints\":{s.num_typeclass_constraints},\"num_forall\":{s.num_forall},\"num_exists\":{s.num_exists},\"num_arrows\":{s.num_arrows},\"max_nesting_depth\":{s.max_nesting_depth},\"conclusion_head\":\"{s.conclusion_head.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"conclusion_arity\":{s.conclusion_arity},\"uses_classical\":{s.uses_classical},\"namespace_depth\":{s.namespace_depth},\"is_polymorphic\":{s.is_polymorphic},\"has_decidable_instances\":{s.has_decidable_instances}}"
+  let hypothesesJson := s.hypotheses.map fun h =>
+    s!"\"{h.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\""
+  let hypothesesStr := "[" ++ ",".intercalate hypothesesJson.toList ++ "]"
+  
+  let hypothesisHeadsJson := s.hypothesis_heads.map fun h =>
+    s!"\"{h.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\""
+  let hypothesisHeadsStr := "[" ++ ",".intercalate hypothesisHeadsJson.toList ++ "]"
+  
+  s!"\{\"name\":\"{s.name.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"kind\":\"{s.kind}\",\"type\":\"{s.type.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"binders\":{bindersStr},\"hypotheses\":{hypothesesStr},\"hypothesis_heads\":{hypothesisHeadsStr},\"conclusion\":\"{s.conclusion.replace "\"" "\\\"" |>.replace "\n" "\\n" |>.replace "\\" "\\\\"}\",\"num_explicit_premises\":{s.num_explicit_premises},\"num_implicit_args\":{s.num_implicit_args},\"num_typeclass_constraints\":{s.num_typeclass_constraints},\"num_forall\":{s.num_forall},\"num_exists\":{s.num_exists},\"num_arrows\":{s.num_arrows},\"max_nesting_depth\":{s.max_nesting_depth},\"conclusion_head\":\"{s.conclusion_head.replace "\"" "\\\"" |>.replace "\\" "\\\\"}\",\"conclusion_arity\":{s.conclusion_arity},\"uses_classical\":{s.uses_classical},\"namespace_depth\":{s.namespace_depth},\"is_polymorphic\":{s.is_polymorphic},\"has_decidable_instances\":{s.has_decidable_instances}}"
 
 def Lean.ConstantInfo.kind : ConstantInfo → String
   | .axiomInfo  _ => "axiom"
